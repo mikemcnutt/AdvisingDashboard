@@ -4,7 +4,7 @@ import sys
 import html
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -120,16 +120,68 @@ def find_semester_plan(obj: dict, season: str, year: str) -> Optional[dict]:
             return p
     return None
 
-def classify(obj: dict, season: str, year: str) -> str:
+
+# -----------------------------
+# Advising status logic (multi-term)
+# -----------------------------
+# Per-term status symbols:
+# ⛔ = unadvised (no plan or empty courses)
+# ⚠️ = advised but not complete (notComplete true, AND courses not empty)
+# ✅ = advised (courses exist and notComplete not true)
+
+def term_state(obj: dict, season: str, year: str) -> str:
     """
-    Returns: "needs" | "partial" | "done"
+    Returns: "unadvised" | "partial" | "done"
+    Rule: If courses list is empty => UNADVISED.
     """
     plan = find_semester_plan(obj, season, year)
     if plan is None:
-        return "needs"
+        return "unadvised"
+
+    courses = plan.get("courses", [])
+    if not isinstance(courses, list) or len(courses) == 0:
+        return "unadvised"
+
     if bool(plan.get("notComplete")):
         return "partial"
+
     return "done"
+
+def classify_multi(obj: dict, terms: List[Tuple[str, str]]) -> str:
+    """
+    Overall bucket for the selected set of terms.
+    - If any selected term is unadvised -> needs
+    - Else if any selected term is partial -> partial
+    - Else -> done
+    """
+    any_unadvised = False
+    any_partial = False
+
+    for season, year in terms:
+        st = term_state(obj, season, year)
+        if st == "unadvised":
+            any_unadvised = True
+        elif st == "partial":
+            any_partial = True
+
+    if any_unadvised:
+        return "needs"
+    if any_partial:
+        return "partial"
+    return "done"
+
+def term_badges(obj: dict, terms: List[Tuple[str, str]]) -> str:
+    parts = []
+    for season, year in terms:
+        st = term_state(obj, season, year)
+        if st == "unadvised":
+            sym = "⛔"
+        elif st == "partial":
+            sym = "⚠️"
+        else:
+            sym = "✅"
+        parts.append(f"{season}: {sym}")
+    return "  ".join(parts)
 
 
 # -----------------------------
@@ -323,14 +375,17 @@ class AdvisingDashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Advising Dashboard")
-        self.geometry("1220x790")
-        self.minsize(1100, 700)
+        self.geometry("1280x840")
+        self.minsize(1180, 740)
 
         self.tooltip = Tooltip(self)
 
-        self.season_var = tk.StringVar(value="Fall")
         self.year_var = tk.StringVar(value="2026")
         self.folder_var = tk.StringVar(value=str(self.default_advising_folder()))
+
+        self.spring_var = tk.BooleanVar(value=False)
+        self.summer_var = tk.BooleanVar(value=False)
+        self.fall_var = tk.BooleanVar(value=True)
 
         self.count_needs = tk.StringVar(value="Needs Advised: 0")
         self.count_partial = tk.StringVar(value="Advised Not Complete: 0")
@@ -350,11 +405,25 @@ class AdvisingDashboardApp(tk.Tk):
         self._build_ui()
 
     def default_advising_folder(self) -> Path:
-        base = app_base_dir()
-        return base / "Advising"
+        return app_base_dir() / "Advising"
+
+    def selected_terms(self) -> List[Tuple[str, str]]:
+        year = self.year_var.get().strip()
+        out: List[Tuple[str, str]] = []
+        if self.spring_var.get():
+            out.append(("Spring", year))
+        if self.summer_var.get():
+            out.append(("Summer", year))
+        if self.fall_var.get():
+            out.append(("Fall", year))
+        return out
 
     def term_label(self) -> str:
-        return f"{self.season_var.get()} {self.year_var.get()}"
+        year = self.year_var.get().strip()
+        terms = [t for (t, _y) in self.selected_terms()]
+        if not terms:
+            return year
+        return f"{'/'.join(terms)} {year}"
 
     def _apply_theme(self):
         self.configure(bg=ROYAL_BLUE)
@@ -389,20 +458,54 @@ class AdvisingDashboardApp(tk.Tk):
             "schedulingLink": self.scheduling_link_var.get()
         })
 
-    def _build_ui(self):
-        top = ttk.Labelframe(self, text="Controls", padding=12, style="Top.TLabelframe")
-        top.pack(fill="x", padx=12, pady=(12, 10))
+    def _quick_pair_summer_fall(self):
+        self.spring_var.set(False)
+        self.summer_var.set(True)
+        self.fall_var.set(True)
 
-        ttk.Label(top, text="Semester:", foreground=TEXT_LIGHT, background=ROYAL_BLUE, font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Combobox(top, textvariable=self.season_var, state="readonly",
-                     values=["Spring", "Summer", "Fall"], width=10).pack(side="left", padx=(8, 16))
+    def _build_ui(self):
+        # Header
+        header = tk.Frame(self, bg=ROYAL_BLUE)
+        header.pack(fill="x", pady=(10, 2))
+        tk.Label(
+            header,
+            text="One Dashboard To Rule Them All",
+            bg=ROYAL_BLUE,
+            fg="white",
+            font=("Segoe UI", 22, "bold")
+        ).pack(pady=(2, 6))
+
+        top = ttk.Labelframe(self, text="Controls", padding=12, style="Top.TLabelframe")
+        top.pack(fill="x", padx=12, pady=(8, 10))
 
         ttk.Label(top, text="Year:", foreground=TEXT_LIGHT, background=ROYAL_BLUE, font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Combobox(top, textvariable=self.year_var, state="readonly",
                      values=[str(y) for y in range(2026, 2041)], width=8).pack(side="left", padx=(8, 16))
 
-        ttk.Label(top, text="Advising folder:", foreground=TEXT_LIGHT, background=ROYAL_BLUE, font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Entry(top, textvariable=self.folder_var, width=54).pack(side="left", padx=(8, 8))
+        ttk.Label(top, text="Advise for:", foreground=TEXT_LIGHT, background=ROYAL_BLUE, font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        def blue_check(master, text, var):
+            cb = tk.Checkbutton(
+                master, text=text, variable=var,
+                bg=ROYAL_BLUE, fg=TEXT_LIGHT,
+                activebackground=ROYAL_BLUE, activeforeground=TEXT_LIGHT,
+                selectcolor=ROYAL_BLUE_DARK,
+                font=("Segoe UI", 10, "bold"),
+                highlightthickness=0
+            )
+            cb.pack(side="left", padx=(10, 0))
+            return cb
+
+        blue_check(top, "Spring", self.spring_var)
+        blue_check(top, "Summer", self.summer_var)
+        blue_check(top, "Fall", self.fall_var)
+
+        ttk.Button(top, text="Quick pair: Summer + Fall", style="Ghost.TButton",
+                   command=self._quick_pair_summer_fall).pack(side="left", padx=(16, 16))
+
+        ttk.Label(top, text="Advising folder:", foreground=TEXT_LIGHT, background=ROYAL_BLUE,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Entry(top, textvariable=self.folder_var, width=46).pack(side="left", padx=(8, 8))
 
         ttk.Button(top, text="Browse…", style="Ghost.TButton", command=self.browse_folder).pack(side="left", padx=(0, 10))
         ttk.Button(top, text="Scan", style="Blue.TButton", command=self.scan).pack(side="left")
@@ -429,7 +532,7 @@ class AdvisingDashboardApp(tk.Tk):
 
         ttk.Label(row1, text="Scheduling link:", background=ROYAL_BLUE_CARD, foreground=TEXT_DARK,
                   font=("Segoe UI", 10, "bold")).pack(side="left")
-        link_entry = ttk.Entry(row1, textvariable=self.scheduling_link_var, width=40)
+        link_entry = ttk.Entry(row1, textvariable=self.scheduling_link_var, width=44)
         link_entry.pack(side="left", padx=(8, 0))
 
         subj_entry.bind("<FocusOut>", lambda _e: self._save_settings())
@@ -440,8 +543,7 @@ class AdvisingDashboardApp(tk.Tk):
 
         self.email_body = tk.Text(email_box, height=4, wrap="word", bd=1, relief="solid", highlightthickness=0)
         self.email_body.pack(fill="x", expand=True)
-        self.email_body.insert("1.0", "Please reply to schedule an advising appointment for the selected semester.")
-        self.email_body.bind("<FocusOut>", lambda _e: self._save_settings())
+        self.email_body.insert("1.0", "Please reply to schedule an advising appointment for the selected semester(s).")
 
         main = ttk.Frame(self, padding=(12, 0, 12, 12), style="Main.TFrame")
         main.pack(fill="both", expand=True)
@@ -563,7 +665,7 @@ class AdvisingDashboardApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Email failed", str(e))
 
-    def _render_needs(self):
+    def _render_needs(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.needs_list.clear()
         self.needs_checks.clear()
 
@@ -580,12 +682,24 @@ class AdvisingDashboardApp(tk.Tk):
             tk.Checkbutton(row, variable=var, bg=ROYAL_BLUE_CARD, activebackground=ROYAL_BLUE_CARD,
                           highlightthickness=0).pack(side="left", padx=(0, 10))
 
-            ttk.Label(row, text=s.display_name, background=ROYAL_BLUE_CARD, foreground=TEXT_DARK,
-                      font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 10))
-            ttk.Label(row, text=s.student_id, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
-                      font=("Segoe UI", 9)).pack(side="left")
+            left = ttk.Frame(row)
+            left.pack(side="left", fill="x", expand=True)
 
-    def _render_partial(self):
+            ttk.Label(left, text=s.display_name, background=ROYAL_BLUE_CARD, foreground=TEXT_DARK,
+                      font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+            badges = ""
+            obj = obj_by_path.get(s.json_path)
+            if obj is not None:
+                badges = term_badges(obj, terms)
+
+            ttk.Label(left, text=badges, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(anchor="w")
+
+            ttk.Label(row, text=s.student_id, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(side="right")
+
+    def _render_partial(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.partial_list.clear()
 
         for s in self.partial_students:
@@ -600,6 +714,15 @@ class AdvisingDashboardApp(tk.Tk):
 
             ttk.Label(left, text=s.display_name, background=ROYAL_BLUE_CARD, foreground=TEXT_DARK,
                       font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+            badges = ""
+            obj = obj_by_path.get(s.json_path)
+            if obj is not None:
+                badges = term_badges(obj, terms)
+
+            ttk.Label(left, text=badges, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(anchor="w")
+
             ttk.Label(left, text=s.student_id, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
                       font=("Segoe UI", 9)).pack(anchor="w")
 
@@ -617,7 +740,7 @@ class AdvisingDashboardApp(tk.Tk):
             ttk.Button(right, text="Email", style="Pill.TButton",
                        command=lambda stu=s: self.email_one_partial(stu)).pack(side="left")
 
-    def _render_done(self):
+    def _render_done(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.done_list.clear()
 
         for s in self.done_students:
@@ -632,19 +755,31 @@ class AdvisingDashboardApp(tk.Tk):
 
             ttk.Label(left, text=s.display_name, background=ROYAL_BLUE_CARD, foreground=TEXT_DARK,
                       font=("Segoe UI", 10, "bold")).pack(anchor="w")
-            ttk.Label(left, text=s.student_id, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
+
+            badges = ""
+            obj = obj_by_path.get(s.json_path)
+            if obj is not None:
+                badges = term_badges(obj, terms)
+
+            ttk.Label(left, text=badges, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
                       font=("Segoe UI", 9)).pack(anchor="w")
 
+            ttk.Label(row, text=s.student_id, background=ROYAL_BLUE_CARD, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(side="right")
+
     def scan(self):
+        terms = self.selected_terms()
+        if not terms:
+            messagebox.showerror("Select term(s)", "Pick at least one term (Spring/Summer/Fall) to scan.")
+            return
+
         folder = Path(self.folder_var.get()).expanduser()
         if not folder.exists() or not folder.is_dir():
             messagebox.showerror("Folder not found", f"Advising folder does not exist:\n{folder}")
             return
 
-        season = self.season_var.get()
-        year = self.year_var.get()
-        term = self.term_label()
-        self.set_status(f"Scanning for {term}…")
+        label = self.term_label()
+        self.set_status(f"Scanning for {label}…")
 
         needs: list[StudentInfo] = []
         partial: list[StudentInfo] = []
@@ -653,10 +788,14 @@ class AdvisingDashboardApp(tk.Tk):
         files = list(iter_json_files(folder))
         bad_files = 0
 
+        obj_by_path: dict = {}
+
         for p in files:
             try:
                 obj = load_json(p)
-                bucket = classify(obj, season, year)
+                obj_by_path[str(p)] = obj
+
+                bucket = classify_multi(obj, terms)
                 info = extract_student_info(obj, str(p))
 
                 if bucket == "needs":
@@ -677,9 +816,9 @@ class AdvisingDashboardApp(tk.Tk):
         self.partial_students = partial
         self.done_students = done
 
-        self._render_needs()
-        self._render_partial()
-        self._render_done()
+        self._render_needs(obj_by_path, terms)
+        self._render_partial(obj_by_path, terms)
+        self._render_done(obj_by_path, terms)
 
         n_needs = len(needs)
         n_partial = len(partial)
