@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, DefaultDict
 from collections import defaultdict
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -732,10 +732,10 @@ class AdvisingDashboardApp(tk.Tk):
         ttk.Button(needs_controls, text="Select all", style="Blue.TButton", command=self.needs_select_all).pack(side="left")
         ttk.Button(needs_controls, text="Select none", style="Blue.TButton", command=self.needs_select_none).pack(side="left", padx=(8, 0))
 
-        ttk.Button(needs_controls, text="Create Draft", style="Blue.TButton",
-                   command=lambda: self.email_selected_needs(draft=True)).pack(side="right")
         ttk.Button(needs_controls, text="Send Email", style="Blue.TButton",
-                   command=lambda: self.email_selected_needs(draft=False)).pack(side="right", padx=(0, 8))
+                   command=lambda: self.email_selected_needs(draft=False)).pack(side="right")
+        ttk.Button(needs_controls, text="Create Draft", style="Blue.TButton",
+                   command=lambda: self.email_selected_needs(draft=True)).pack(side="right", padx=(0, 8))
 
         self.needs_list = ScrollableFrame(self.frame_needs)
         self.needs_list.pack(fill="both", expand=True)
@@ -882,7 +882,13 @@ class AdvisingDashboardApp(tk.Tk):
         token = uuid.uuid4().hex
         self.server.set_mapping(token, Path(json_path))
 
-        url = f"http://127.0.0.1:{self.server.port}/{self.server.html_path.name}?token={token}&json=/api/student?token={token}&save=/api/save?token={token}"
+        params = urlencode({
+            "token": token,
+            "json": f"/api/student?token={token}",
+            "save": f"/api/save?token={token}",
+        })
+        url = f"http://127.0.0.1:{self.server.port}/{self.server.html_path.name}?{params}"
+
         try:
             webbrowser.open(url)
         except Exception as e:
@@ -1093,6 +1099,7 @@ class AdvisingDashboardApp(tk.Tk):
 def main():
     app = AdvisingDashboardApp()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
