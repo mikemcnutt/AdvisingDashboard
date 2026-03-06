@@ -36,16 +36,14 @@ TEXT_DARK = "#0f172a"
 TEXT_MUTED = "#334155"
 
 TRACK_LABELS = {
+    "BS": "Business Software and Support",
+    "CL": "Cloud Computing Technologies",
     "GT": "General Track",
+    "IS": "Information Security",
+    "IT": "Internet Technologies",
     "NA": "Network Administration",
     "NT": "Network Technologies",
     "PR": "Programming",
-}
-
-SUBTRACK_LABELS = {
-    "MS": "Microsoft Networking",
-    "CS": "Cisco Networking",
-    "LX": "Linux Administration",
 }
 
 
@@ -70,11 +68,6 @@ class StudentInfo:
     def track_label(self) -> str:
         code = (self.track_code or "").strip()
         return TRACK_LABELS.get(code, code or "Unknown Track")
-
-    @property
-    def subtrack_label(self) -> str:
-        code = (self.subtrack_code or "").strip()
-        return SUBTRACK_LABELS.get(code, code or "No Subtrack")
 
 
 def safe_str(v) -> str:
@@ -532,6 +525,7 @@ class AdvisingDashboardApp(tk.Tk):
         self.fall_var = tk.BooleanVar(value=True)
 
         self.search_var = tk.StringVar(value="")
+        self.track_filter_var = tk.StringVar(value="All Tracks")
 
         self.count_needs = tk.StringVar(value="Needs Advised: 0")
         self.count_partial = tk.StringVar(value="Advised Not Complete: 0")
@@ -556,6 +550,7 @@ class AdvisingDashboardApp(tk.Tk):
         self.spring_var.set(bool(s.get("last_spring", False)))
         self.summer_var.set(bool(s.get("last_summer", False)))
         self.fall_var.set(bool(s.get("last_fall", True)))
+        self.track_filter_var.set(s.get("last_track_filter", "All Tracks"))
 
         self._last_obj_by_path: dict = {}
         self._last_terms: List[Tuple[str, str]] = []
@@ -566,6 +561,7 @@ class AdvisingDashboardApp(tk.Tk):
         self._build_ui()
 
         self.search_var.trace_add("write", lambda *_: self.apply_filter())
+        self.track_filter_var.trace_add("write", lambda *_: (self._save_settings(), self.apply_filter()))
         self.year_var.trace_add("write", lambda *_: self._save_settings())
         self.folder_var.trace_add("write", lambda *_: self._save_settings())
         self.spring_var.trace_add("write", lambda *_: self._save_settings())
@@ -625,6 +621,7 @@ class AdvisingDashboardApp(tk.Tk):
             "last_spring": self.spring_var.get(),
             "last_summer": self.summer_var.get(),
             "last_fall": self.fall_var.get(),
+            "last_track_filter": self.track_filter_var.get(),
         })
         save_settings(existing)
 
@@ -647,6 +644,7 @@ class AdvisingDashboardApp(tk.Tk):
         settings["last_spring"] = self.spring_var.get()
         settings["last_summer"] = self.summer_var.get()
         settings["last_fall"] = self.fall_var.get()
+        settings["last_track_filter"] = self.track_filter_var.get()
 
         save_settings(settings)
         self.destroy()
@@ -720,6 +718,18 @@ class AdvisingDashboardApp(tk.Tk):
         ttk.Label(top, text="Search:", foreground=TEXT_DARK, background=CARD_BG,
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Entry(top, textvariable=self.search_var, width=22).pack(side="left", padx=(8, 16))
+
+        ttk.Label(top, text="Track:", foreground=TEXT_DARK, background=CARD_BG,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        self.track_filter_combo = ttk.Combobox(
+            top,
+            textvariable=self.track_filter_var,
+            state="readonly",
+            width=28,
+            values=["All Tracks"]
+        )
+        self.track_filter_combo.pack(side="left", padx=(8, 16))
 
         ttk.Label(top, text="Advising folder:", foreground=TEXT_DARK, background=CARD_BG,
                   font=("Segoe UI", 10, "bold")).pack(side="left")
@@ -826,17 +836,37 @@ class AdvisingDashboardApp(tk.Tk):
         return self.scheduling_link_var.get().strip()
 
     def _matches_search(self, s: StudentInfo, q: str) -> bool:
+        selected_track = self.track_filter_var.get().strip()
+
+        if selected_track and selected_track != "All Tracks":
+            if s.track_label != selected_track:
+                return False
+
         if not q:
             return True
+
         blob = " ".join([
             s.display_name,
             s.student_id,
             s.kctcs_email,
             s.personal_email,
-            s.track_label,
-            s.subtrack_label
+            s.track_label
         ]).lower()
+
         return q in blob
+
+    def _refresh_track_filter_options(self):
+        track_names = sorted({
+            s.track_label
+            for s in (self.all_needs_students + self.all_partial_students + self.all_done_students)
+            if s.track_label
+        })
+
+        values = ["All Tracks"] + track_names
+        self.track_filter_combo["values"] = values
+
+        if self.track_filter_var.get() not in values:
+            self.track_filter_var.set("All Tracks")
 
     def apply_filter(self):
         q = self.search_var.get().strip().lower()
@@ -1155,6 +1185,8 @@ class AdvisingDashboardApp(tk.Tk):
         self.all_needs_students = needs
         self.all_partial_students = partial
         self.all_done_students = done
+
+        self._refresh_track_filter_options()
 
         self._last_obj_by_path = obj_by_path
         self._last_terms = terms
