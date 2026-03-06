@@ -508,9 +508,19 @@ class AdvisingDashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1320x860")
         self.minsize(1180, 740)
         self.configure(bg=ROYAL_BG)
+
+        settings = load_settings()
+        window_state = settings.get("window_state", "zoomed")
+        if window_state == "zoomed":
+            self.state("zoomed")
+        else:
+            geom = settings.get("window_geometry")
+            if geom:
+                self.geometry(geom)
+            else:
+                self.state("zoomed")
 
         self.tooltip = Tooltip(self)
 
@@ -541,6 +551,12 @@ class AdvisingDashboardApp(tk.Tk):
         self.subject_var = tk.StringVar(value=s.get("subject", "Advising Appointment Needed"))
         self.scheduling_link_var = tk.StringVar(value=s.get("schedulingLink", ""))
 
+        self.year_var.set(s.get("last_year", "2026"))
+        self.folder_var.set(s.get("last_folder", str(self.default_advising_folder())))
+        self.spring_var.set(bool(s.get("last_spring", False)))
+        self.summer_var.set(bool(s.get("last_summer", False)))
+        self.fall_var.set(bool(s.get("last_fall", True)))
+
         self._last_obj_by_path: dict = {}
         self._last_terms: List[Tuple[str, str]] = []
 
@@ -550,6 +566,13 @@ class AdvisingDashboardApp(tk.Tk):
         self._build_ui()
 
         self.search_var.trace_add("write", lambda *_: self.apply_filter())
+        self.year_var.trace_add("write", lambda *_: self._save_settings())
+        self.folder_var.trace_add("write", lambda *_: self._save_settings())
+        self.spring_var.trace_add("write", lambda *_: self._save_settings())
+        self.summer_var.trace_add("write", lambda *_: self._save_settings())
+        self.fall_var.trace_add("write", lambda *_: self._save_settings())
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def default_advising_folder(self) -> Path:
         return app_base_dir() / "Advising"
@@ -593,10 +616,40 @@ class AdvisingDashboardApp(tk.Tk):
         style.configure("Summary.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI", 10, "bold"))
 
     def _save_settings(self):
-        save_settings({
+        existing = load_settings()
+        existing.update({
             "subject": self.subject_var.get(),
-            "schedulingLink": self.scheduling_link_var.get()
+            "schedulingLink": self.scheduling_link_var.get(),
+            "last_year": self.year_var.get(),
+            "last_folder": self.folder_var.get(),
+            "last_spring": self.spring_var.get(),
+            "last_summer": self.summer_var.get(),
+            "last_fall": self.fall_var.get(),
         })
+        save_settings(existing)
+
+    def on_close(self):
+        settings = load_settings()
+
+        try:
+            if self.state() == "zoomed":
+                settings["window_state"] = "zoomed"
+            else:
+                settings["window_state"] = "normal"
+                settings["window_geometry"] = self.geometry()
+        except Exception:
+            pass
+
+        settings["subject"] = self.subject_var.get()
+        settings["schedulingLink"] = self.scheduling_link_var.get()
+        settings["last_year"] = self.year_var.get()
+        settings["last_folder"] = self.folder_var.get()
+        settings["last_spring"] = self.spring_var.get()
+        settings["last_summer"] = self.summer_var.get()
+        settings["last_fall"] = self.fall_var.get()
+
+        save_settings(settings)
+        self.destroy()
 
     def _quick_pair_summer_fall(self):
         self.spring_var.set(False)
