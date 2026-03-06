@@ -984,34 +984,52 @@ class AdvisingDashboardApp(tk.Tk):
         self.needs_list.clear()
         self.needs_checks.clear()
 
-        for s in sorted(self.needs_students, key=lambda x: x.display_name.lower()):
-            holder = tk.Frame(self.needs_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
-            holder.pack(fill="x", pady=4)
+        for track_label, group_students in self._grouped_by_track(self.needs_students):
+            self._render_track_header(self.needs_list.inner, track_label, len(group_students))
 
-            row = ttk.Frame(holder)
-            row.pack(fill="x", padx=8, pady=6)
+            for s in group_students:
+                holder = tk.Frame(self.needs_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
+                holder.pack(fill="x", pady=4)
 
-            var = tk.BooleanVar(value=True)
-            self.needs_checks[s.json_path] = var
+                row = ttk.Frame(holder)
+                row.pack(fill="x", padx=8, pady=6)
 
-            tk.Checkbutton(row, variable=var, bg=CARD_BG, activebackground=CARD_BG,
-                           highlightthickness=0).pack(side="left", padx=(0, 10))
+                var = tk.BooleanVar(value=True)
+                self.needs_checks[s.json_path] = var
 
-            left = ttk.Frame(row)
-            left.pack(side="left", fill="x", expand=True)
+                tk.Checkbutton(
+                    row,
+                    variable=var,
+                    bg=CARD_BG,
+                    activebackground=CARD_BG,
+                    highlightthickness=0
+                ).pack(side="left", padx=(0, 10))
 
-            self._render_name_link(left, s.display_name, s.json_path)
+                left = ttk.Frame(row)
+                left.pack(side="left", fill="x", expand=True)
 
-            badges = ""
-            obj = obj_by_path.get(s.json_path)
-            if obj is not None:
-                badges = term_badges(obj, terms)
+                self._render_name_link(left, s.display_name, s.json_path)
 
-            ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
-                      font=("Segoe UI", 9)).pack(anchor="w")
+                badges = ""
+                obj = obj_by_path.get(s.json_path)
+                if obj is not None:
+                    badges = term_badges(obj, terms)
 
-            ttk.Label(row, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
-                      font=("Segoe UI", 9)).pack(side="right")
+                ttk.Label(
+                    left,
+                    text=badges,
+                    background=CARD_BG,
+                    foreground=TEXT_MUTED,
+                    font=("Segoe UI", 9)
+                ).pack(anchor="w")
+
+                ttk.Label(
+                    row,
+                    text=s.student_id,
+                    background=CARD_BG,
+                    foreground=TEXT_MUTED,
+                    font=("Segoe UI", 9)
+                ).pack(side="right")
 
     def _render_partial(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.partial_list.clear()
