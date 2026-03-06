@@ -18,33 +18,28 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
-    import win32com.client  # pywin32 (Windows only)
+    import win32com.client
 except Exception:
     win32com = None
 
 
-# -----------------------------
-# Theme
-# -----------------------------
 APP_TITLE = "Advising Dashboard"
 HEADER_TEXT = "One Dashboard To Rule Them All"
 
-ROYAL_BG = "#0b1f5e"      # solid background behind everything
-CARD_BG = "#e0e7ff"       # card background
-BORDER_BLUE = "#93c5fd"   # card border
+ROYAL_BG = "#0b1f5e"
+CARD_BG = "#e0e7ff"
+BORDER_BLUE = "#93c5fd"
 ROYAL_BLUE_DARK = "#1e40af"
 ROYAL_BLUE_LIGHT = "#3b82f6"
 
 TEXT_DARK = "#0f172a"
 TEXT_MUTED = "#334155"
 
-
-# Track/Subtrack label mapping (fallbacks to the code if unknown)
 TRACK_LABELS = {
-    "GT": "AAS – Network Administration",
-    "NA": "AAS – Network Administration",
-    "NT": "AAS – Network Technologies",
-    "PR": "AAS – Programming",
+    "GT": "General Track",
+    "NA": "Network Administration",
+    "NT": "Network Technologies",
+    "PR": "Programming",
 }
 
 SUBTRACK_LABELS = {
@@ -54,9 +49,6 @@ SUBTRACK_LABELS = {
 }
 
 
-# -----------------------------
-# Data
-# -----------------------------
 @dataclass
 class StudentInfo:
     first_name: str
@@ -84,23 +76,18 @@ class StudentInfo:
         code = (self.subtrack_code or "").strip()
         return SUBTRACK_LABELS.get(code, code or "No Subtrack")
 
-    @property
-    def group_key(self) -> Tuple[str, str, str, str]:
-        # Sortable/group-friendly key: (track_label, subtrack_label, track_code, subtrack_code)
-        return (self.track_label, self.subtrack_label, (self.track_code or ""), (self.subtrack_code or ""))
 
-
-# -----------------------------
-# Helpers
-# -----------------------------
 def safe_str(v) -> str:
     return "" if v is None else str(v)
+
 
 def app_base_dir() -> Path:
     return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
+
 def settings_path() -> Path:
     return app_base_dir() / "settings.json"
+
 
 def load_settings() -> dict:
     p = settings_path()
@@ -111,6 +98,7 @@ def load_settings() -> dict:
     except Exception:
         return {}
 
+
 def save_settings(d: dict):
     p = settings_path()
     try:
@@ -118,40 +106,34 @@ def save_settings(d: dict):
     except Exception:
         pass
 
+
 def load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def iter_json_files(root: Path):
     for p in root.rglob("*.json"):
         yield p
+
 
 def extract_student_info(obj: dict, json_path: str) -> StudentInfo:
     student = obj.get("student") if isinstance(obj.get("student"), dict) else {}
     data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     sel = obj.get("selection") if isinstance(obj.get("selection"), dict) else {}
 
-    first_name = safe_str(student.get("firstName")).strip()
-    last_name = safe_str(student.get("lastName")).strip()
-    student_id = safe_str(student.get("studentId")).strip()
-    kctcs_email = safe_str(student.get("kctcsEmail")).strip()
-    personal_email = safe_str(student.get("personalEmail")).strip()
-    notes = safe_str(data.get("notes")).strip()
-
-    track_code = safe_str(sel.get("scenario")).strip()
-    subtrack_code = safe_str(sel.get("subplan")).strip()
-
     return StudentInfo(
-        first_name=first_name,
-        last_name=last_name,
-        student_id=student_id,
-        kctcs_email=kctcs_email,
-        personal_email=personal_email,
-        notes=notes,
-        track_code=track_code,
-        subtrack_code=subtrack_code,
+        first_name=safe_str(student.get("firstName")).strip(),
+        last_name=safe_str(student.get("lastName")).strip(),
+        student_id=safe_str(student.get("studentId")).strip(),
+        kctcs_email=safe_str(student.get("kctcsEmail")).strip(),
+        personal_email=safe_str(student.get("personalEmail")).strip(),
+        notes=safe_str(data.get("notes")).strip(),
+        track_code=safe_str(sel.get("scenario")).strip(),
+        subtrack_code=safe_str(sel.get("subplan")).strip(),
         json_path=json_path
     )
+
 
 def find_semester_plan(obj: dict, season: str, year: str) -> Optional[dict]:
     data = obj.get("data")
@@ -169,14 +151,7 @@ def find_semester_plan(obj: dict, season: str, year: str) -> Optional[dict]:
     return None
 
 
-# -----------------------------
-# Advising status logic (multi-term)
-# -----------------------------
 def term_state(obj: dict, season: str, year: str) -> str:
-    """
-    Returns: "unadvised" | "partial" | "done"
-    Rule: If courses list is empty => UNADVISED.
-    """
     plan = find_semester_plan(obj, season, year)
     if plan is None:
         return "unadvised"
@@ -190,13 +165,8 @@ def term_state(obj: dict, season: str, year: str) -> str:
 
     return "done"
 
+
 def classify_multi(obj: dict, terms: List[Tuple[str, str]]) -> str:
-    """
-    Overall bucket for the selected set of terms.
-    - If any selected term is unadvised -> needs
-    - Else if any selected term is partial -> partial
-    - Else -> done
-    """
     any_unadvised = False
     any_partial = False
 
@@ -213,6 +183,7 @@ def classify_multi(obj: dict, terms: List[Tuple[str, str]]) -> str:
         return "partial"
     return "done"
 
+
 def term_badges(obj: dict, terms: List[Tuple[str, str]]) -> str:
     parts = []
     for season, year in terms:
@@ -227,9 +198,6 @@ def term_badges(obj: dict, terms: List[Tuple[str, str]]) -> str:
     return "  ".join(parts)
 
 
-# -----------------------------
-# Tooltip
-# -----------------------------
 class Tooltip:
     def __init__(self, parent: tk.Widget):
         self.parent = parent
@@ -267,9 +235,6 @@ class Tooltip:
         self.tip = None
 
 
-# -----------------------------
-# Scrollable Frame
-# -----------------------------
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
@@ -286,7 +251,6 @@ class ScrollableFrame(ttk.Frame):
 
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add=True)
 
     def _on_inner_configure(self, _):
@@ -305,17 +269,16 @@ class ScrollableFrame(ttk.Frame):
             child.destroy()
 
 
-# -----------------------------
-# Outlook email (HTML)
-# -----------------------------
 def ensure_outlook_ready():
     if platform.system().lower() != "windows":
         raise RuntimeError("Outlook emailing is only supported on Windows.")
     if win32com is None:
         raise RuntimeError("pywin32 is not installed. Install on Windows with: pip install pywin32")
 
+
 def _nl2br(text: str) -> str:
     return html.escape(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
 
 def build_email_subject(base_subject: str, term_label: str) -> str:
     s = (base_subject or "").strip()
@@ -324,6 +287,7 @@ def build_email_subject(base_subject: str, term_label: str) -> str:
     if term_label and term_label.lower() in s.lower():
         return s
     return f"{s} — {term_label}" if term_label else s
+
 
 def build_email_html(first_name: str, message_text: str, scheduling_link: str) -> str:
     first = (first_name or "").strip() or "there"
@@ -392,6 +356,7 @@ def build_email_html(first_name: str, message_text: str, scheduling_link: str) -
 </html>
 """.strip()
 
+
 def outlook_create_email_html(kctcs_email: str, personal_email: str, subject: str, html_body: str, draft: bool = True):
     ensure_outlook_ready()
 
@@ -411,11 +376,8 @@ def outlook_create_email_html(kctcs_email: str, personal_email: str, subject: st
         mail.Send()
 
 
-# -----------------------------
-# Local editor server (loads/saves student JSON + serves Advising10.html)
-# -----------------------------
 class LocalEditorServer:
-    def __init__(self, base_dir: Path, html_filename: str = "Advising10.html"):
+    def __init__(self, base_dir: Path, html_filename: str = "advising.html"):
         self.base_dir = base_dir
         self.html_path = base_dir / html_filename
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -542,9 +504,6 @@ class LocalEditorServer:
             self._port = None
 
 
-# -----------------------------
-# App
-# -----------------------------
 class AdvisingDashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -585,7 +544,7 @@ class AdvisingDashboardApp(tk.Tk):
         self._last_obj_by_path: dict = {}
         self._last_terms: List[Tuple[str, str]] = []
 
-        self.server = LocalEditorServer(app_base_dir(), "Advising10.html")
+        self.server = LocalEditorServer(app_base_dir(), "advising.html")
 
         self._apply_theme()
         self._build_ui()
@@ -631,10 +590,6 @@ class AdvisingDashboardApp(tk.Tk):
                         font=("Segoe UI", 9, "bold"), padding=(12, 6), borderwidth=0, focusthickness=0)
         style.map("Pill.TButton", background=[("active", ROYAL_BLUE_DARK)])
 
-        style.configure("Ghost.TButton", background=CARD_BG, foreground=ROYAL_BLUE_DARK,
-                        font=("Segoe UI", 9, "bold"), padding=(10, 6), borderwidth=1)
-        style.map("Ghost.TButton", background=[("active", "#c7d2fe")])
-
         style.configure("Summary.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI", 10, "bold"))
 
     def _save_settings(self):
@@ -648,20 +603,38 @@ class AdvisingDashboardApp(tk.Tk):
         self.summer_var.set(True)
         self.fall_var.set(True)
 
+    def _build_glow_title(self, parent):
+        title_wrap = tk.Frame(parent, bg=ROYAL_BG, height=52)
+        title_wrap.pack(fill="x", pady=(2, 8))
+
+        dramatic_font = ("Georgia", 22, "bold italic")
+
+        for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
+            glow = tk.Label(
+                title_wrap,
+                text=HEADER_TEXT,
+                bg=ROYAL_BG,
+                fg="#ffffff",
+                font=dramatic_font
+            )
+            glow.place(relx=0.5, rely=0.5, anchor="center", x=dx, y=dy)
+
+        main = tk.Label(
+            title_wrap,
+            text=HEADER_TEXT,
+            bg=ROYAL_BG,
+            fg="#f8fafc",
+            font=dramatic_font
+        )
+        main.place(relx=0.5, rely=0.5, anchor="center")
+
     def _build_ui(self):
-        # Solid background container
         self.container = tk.Frame(self, bg=ROYAL_BG, highlightthickness=0, bd=0)
         self.container.pack(fill="both", expand=True)
 
         header = tk.Frame(self.container, bg=ROYAL_BG, highlightthickness=0)
         header.pack(fill="x", pady=(10, 2))
-        tk.Label(
-            header,
-            text=HEADER_TEXT,
-            bg=ROYAL_BG,
-            fg="white",
-            font=("Segoe UI", 22, "bold")
-        ).pack(pady=(2, 6))
+        self._build_glow_title(header)
 
         top = ttk.Labelframe(self.container, text="Controls", padding=12, style="Top.TLabelframe")
         top.pack(fill="x", padx=12, pady=(8, 10))
@@ -688,7 +661,7 @@ class AdvisingDashboardApp(tk.Tk):
         blue_check(top, "Summer", self.summer_var)
         blue_check(top, "Fall", self.fall_var)
 
-        ttk.Button(top, text="Quick pair: Summer + Fall", style="Ghost.TButton",
+        ttk.Button(top, text="Quick pair: Summer + Fall", style="Blue.TButton",
                    command=self._quick_pair_summer_fall).pack(side="left", padx=(16, 16))
 
         ttk.Label(top, text="Search:", foreground=TEXT_DARK, background=CARD_BG,
@@ -699,7 +672,7 @@ class AdvisingDashboardApp(tk.Tk):
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Entry(top, textvariable=self.folder_var, width=40).pack(side="left", padx=(8, 8))
 
-        ttk.Button(top, text="Browse…", style="Ghost.TButton", command=self.browse_folder).pack(side="left", padx=(0, 10))
+        ttk.Button(top, text="Browse…", style="Blue.TButton", command=self.browse_folder).pack(side="left", padx=(0, 10))
         ttk.Button(top, text="Scan", style="Blue.TButton", command=self.scan).pack(side="left")
 
         self.status_label = ttk.Label(top, text="Ready", style="Summary.TLabel")
@@ -756,12 +729,12 @@ class AdvisingDashboardApp(tk.Tk):
         needs_controls = ttk.Frame(self.frame_needs)
         needs_controls.pack(fill="x", pady=(0, 8))
 
-        ttk.Button(needs_controls, text="Select all", style="Ghost.TButton", command=self.needs_select_all).pack(side="left")
-        ttk.Button(needs_controls, text="Select none", style="Ghost.TButton", command=self.needs_select_none).pack(side="left", padx=(8, 0))
+        ttk.Button(needs_controls, text="Select all", style="Blue.TButton", command=self.needs_select_all).pack(side="left")
+        ttk.Button(needs_controls, text="Select none", style="Blue.TButton", command=self.needs_select_none).pack(side="left", padx=(8, 0))
 
-        ttk.Button(needs_controls, text="Draft selected", style="Blue.TButton",
+        ttk.Button(needs_controls, text="Create Draft", style="Blue.TButton",
                    command=lambda: self.email_selected_needs(draft=True)).pack(side="right")
-        ttk.Button(needs_controls, text="Send selected", style="Ghost.TButton",
+        ttk.Button(needs_controls, text="Send Email", style="Blue.TButton",
                    command=lambda: self.email_selected_needs(draft=False)).pack(side="right", padx=(0, 8))
 
         self.needs_list = ScrollableFrame(self.frame_needs)
@@ -930,21 +903,21 @@ class AdvisingDashboardApp(tk.Tk):
         lbl.bind("<Leave>", lambda _e: lbl.config(fg=ROYAL_BLUE_DARK))
         return lbl
 
-    def _grouped(self, students: List[StudentInfo]) -> List[Tuple[Tuple[str, str, str, str], List[StudentInfo]]]:
-        buckets: DefaultDict[Tuple[str, str, str, str], List[StudentInfo]] = defaultdict(list)
+    def _grouped_by_track(self, students: List[StudentInfo]) -> List[Tuple[str, List[StudentInfo]]]:
+        buckets: DefaultDict[str, List[StudentInfo]] = defaultdict(list)
         for s in students:
-            buckets[s.group_key].append(s)
+            buckets[s.track_label].append(s)
 
         items = list(buckets.items())
-        items.sort(key=lambda kv: (kv[0][0].lower(), kv[0][1].lower(), kv[0][2].lower(), kv[0][3].lower()))
-        for _k, lst in items:
+        items.sort(key=lambda kv: kv[0].lower())
+        for _track, lst in items:
             lst.sort(key=lambda s: s.display_name.lower())
         return items
 
-    def _render_group_header(self, parent, track_label: str, subtrack_label: str, count: int):
+    def _render_track_header(self, parent, track_label: str, count: int):
         hdr = tk.Frame(parent, bg="#c7d2fe", highlightthickness=0, bd=0)
         hdr.pack(fill="x", pady=(8, 4))
-        txt = f"{track_label} / {subtrack_label} ({count})"
+        txt = f"{track_label} ({count})"
         tk.Label(hdr, text=txt, bg="#c7d2fe", fg=ROYAL_BLUE_DARK,
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=6)
 
@@ -952,43 +925,40 @@ class AdvisingDashboardApp(tk.Tk):
         self.needs_list.clear()
         self.needs_checks.clear()
 
-        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.needs_students):
-            self._render_group_header(self.needs_list.inner, track_label, subtrack_label, len(group_students))
+        for s in sorted(self.needs_students, key=lambda x: x.display_name.lower()):
+            holder = tk.Frame(self.needs_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
+            holder.pack(fill="x", pady=4)
 
-            for s in group_students:
-                holder = tk.Frame(self.needs_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
-                holder.pack(fill="x", pady=4)
+            row = ttk.Frame(holder)
+            row.pack(fill="x", padx=8, pady=6)
 
-                row = ttk.Frame(holder)
-                row.pack(fill="x", padx=8, pady=6)
+            var = tk.BooleanVar(value=True)
+            self.needs_checks[s.json_path] = var
 
-                var = tk.BooleanVar(value=True)
-                self.needs_checks[s.json_path] = var
+            tk.Checkbutton(row, variable=var, bg=CARD_BG, activebackground=CARD_BG,
+                           highlightthickness=0).pack(side="left", padx=(0, 10))
 
-                tk.Checkbutton(row, variable=var, bg=CARD_BG, activebackground=CARD_BG,
-                              highlightthickness=0).pack(side="left", padx=(0, 10))
+            left = ttk.Frame(row)
+            left.pack(side="left", fill="x", expand=True)
 
-                left = ttk.Frame(row)
-                left.pack(side="left", fill="x", expand=True)
+            self._render_name_link(left, s.display_name, s.json_path)
 
-                self._render_name_link(left, s.display_name, s.json_path)
+            badges = ""
+            obj = obj_by_path.get(s.json_path)
+            if obj is not None:
+                badges = term_badges(obj, terms)
 
-                badges = ""
-                obj = obj_by_path.get(s.json_path)
-                if obj is not None:
-                    badges = term_badges(obj, terms)
+            ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(anchor="w")
 
-                ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
-                          font=("Segoe UI", 9)).pack(anchor="w")
-
-                ttk.Label(row, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
-                          font=("Segoe UI", 9)).pack(side="right")
+            ttk.Label(row, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
+                      font=("Segoe UI", 9)).pack(side="right")
 
     def _render_partial(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.partial_list.clear()
 
-        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.partial_students):
-            self._render_group_header(self.partial_list.inner, track_label, subtrack_label, len(group_students))
+        for track_label, group_students in self._grouped_by_track(self.partial_students):
+            self._render_track_header(self.partial_list.inner, track_label, len(group_students))
 
             for s in group_students:
                 holder = tk.Frame(self.partial_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
@@ -1038,8 +1008,8 @@ class AdvisingDashboardApp(tk.Tk):
     def _render_done(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
         self.done_list.clear()
 
-        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.done_students):
-            self._render_group_header(self.done_list.inner, track_label, subtrack_label, len(group_students))
+        for track_label, group_students in self._grouped_by_track(self.done_students):
+            self._render_track_header(self.done_list.inner, track_label, len(group_students))
 
             for s in group_students:
                 holder = tk.Frame(self.done_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
