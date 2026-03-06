@@ -5,6 +5,7 @@ import html
 import uuid
 import threading
 import datetime as dt
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, DefaultDict
@@ -264,7 +265,7 @@ class ScrollableFrame(ttk.Frame):
 
 def ensure_outlook_ready():
     if platform.system().lower() != "windows":
-        raise RuntimeError("Outlook emailing is only supported on Windows.")
+        raise RuntimeError("Outlook desktop automation is only supported on Windows.")
     if win32com is None:
         raise RuntimeError("pywin32 is not installed. Install on Windows with: pip install pywin32")
 
@@ -367,6 +368,49 @@ def outlook_create_email_html(kctcs_email: str, personal_email: str, subject: st
         mail.Save()
     else:
         mail.Send()
+
+
+def open_outlook_web_email(kctcs_email: str, personal_email: str, subject: str, first_name: str, message_text: str, scheduling_link: str):
+    to_list = [e.strip() for e in [kctcs_email, personal_email] if e and str(e).strip()]
+    if not to_list:
+        raise RuntimeError("Student has no email addresses in JSON (KCTCS or personal).")
+
+    greeting_name = (first_name or "").strip() or "there"
+
+    body_lines = [
+        f"Hello {greeting_name},",
+        "",
+        message_text.strip()
+    ]
+
+    if scheduling_link and scheduling_link.strip():
+        body_lines.extend([
+            "",
+            "Schedule Appointment:",
+            scheduling_link.strip()
+        ])
+
+    body_lines.extend([
+        "",
+        "Thanks,",
+        "(Your Advisor)"
+    ])
+
+    body_text = "\n".join(body_lines)
+    body_text = body_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+    params = {
+        "to": ";".join(to_list),
+        "subject": subject,
+        "body": body_text
+    }
+
+    url = "https://outlook.office.com/mail/deeplink/compose?" + urllib.parse.urlencode(
+        params,
+        quote_via=urllib.parse.quote
+    )
+
+    webbrowser.open(url)
 
 
 class LocalEditorServer:
@@ -506,14 +550,32 @@ class AdvisingDashboardApp(tk.Tk):
 
         settings = load_settings()
         window_state = settings.get("window_state", "zoomed")
-        if window_state == "zoomed":
-            self.state("zoomed")
-        else:
-            geom = settings.get("window_geometry")
-            if geom:
-                self.geometry(geom)
-            else:
+
+        if platform.system().lower() == "windows":
+            if window_state == "zoomed":
                 self.state("zoomed")
+            else:
+                geom = settings.get("window_geometry")
+                if geom:
+                    self.geometry(geom)
+                else:
+                    self.state("zoomed")
+        else:
+            if window_state == "zoomed":
+                try:
+                    self.attributes("-zoomed", True)
+                except Exception:
+                    geom = settings.get("window_geometry")
+                    if geom:
+                        self.geometry(geom)
+                    else:
+                        self.geometry("1400x900")
+            else:
+                geom = settings.get("window_geometry")
+                if geom:
+                    self.geometry(geom)
+                else:
+                    self.geometry("1400x900")
 
         self.tooltip = Tooltip(self)
 
@@ -629,11 +691,22 @@ class AdvisingDashboardApp(tk.Tk):
         settings = load_settings()
 
         try:
-            if self.state() == "zoomed":
-                settings["window_state"] = "zoomed"
+            if platform.system().lower() == "windows":
+                if self.state() == "zoomed":
+                    settings["window_state"] = "zoomed"
+                else:
+                    settings["window_state"] = "normal"
+                    settings["window_geometry"] = self.geometry()
             else:
-                settings["window_state"] = "normal"
-                settings["window_geometry"] = self.geometry()
+                try:
+                    if bool(self.attributes("-zoomed")):
+                        settings["window_state"] = "zoomed"
+                    else:
+                        settings["window_state"] = "normal"
+                        settings["window_geometry"] = self.geometry()
+                except Exception:
+                    settings["window_state"] = "normal"
+                    settings["window_geometry"] = self.geometry()
         except Exception:
             pass
 
@@ -908,6 +981,30 @@ class AdvisingDashboardApp(tk.Tk):
             messagebox.showinfo("No selection", "Select at least one student to email.")
             return
 
+        subject = self._current_subject()
+        message_text = self._current_message_text()
+        link = self._current_link()
+
+        if platform.system().lower() != "windows":
+            opened = 0
+            errors = 0
+            for s in selected:
+                try:
+                    open_outlook_web_email(
+                        s.kctcs_email,
+                        s.personal_email,
+                        subject,
+                        s.first_name,
+                        message_text,
+                        link
+                    )
+                    opened += 1
+                except Exception:
+                    errors += 1
+
+            messagebox.showinfo("Email complete", f"Opened Outlook Web drafts: {opened}\nErrors: {errors}")
+            return
+
         try:
             ensure_outlook_ready()
         except Exception as e:
@@ -918,10 +1015,6 @@ class AdvisingDashboardApp(tk.Tk):
             confirm = messagebox.askyesno("Confirm send", f"Send {len(selected)} email(s) now?")
             if not confirm:
                 return
-
-        subject = self._current_subject()
-        message_text = self._current_message_text()
-        link = self._current_link()
 
         ok = 0
         err = 0
@@ -938,15 +1031,30 @@ class AdvisingDashboardApp(tk.Tk):
         messagebox.showinfo("Email complete", f"{mode}: {ok}\nErrors: {err}")
 
     def email_one_partial(self, s: StudentInfo):
+        subject = self._current_subject()
+        message_text = self._current_message_text()
+        link = self._current_link()
+
+        if platform.system().lower() != "windows":
+            try:
+                open_outlook_web_email(
+                    s.kctcs_email,
+                    s.personal_email,
+                    subject,
+                    s.first_name,
+                    message_text,
+                    link
+                )
+                messagebox.showinfo("Email opened", f"Outlook Web draft opened for {s.display_name}.")
+            except Exception as e:
+                messagebox.showerror("Email failed", str(e))
+            return
+
         try:
             ensure_outlook_ready()
         except Exception as e:
             messagebox.showerror("Email unavailable", str(e))
             return
-
-        subject = self._current_subject()
-        message_text = self._current_message_text()
-        link = self._current_link()
 
         try:
             html_body = build_email_html(s.first_name, message_text, link)
