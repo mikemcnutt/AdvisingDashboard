@@ -1,262 +1,1128 @@
 import json
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
-import webbrowser
-import uuid
-import datetime
+import platform
+import sys
 import html
-import win32com.client
+import uuid
+import threading
+import datetime as dt
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, DefaultDict
+from collections import defaultdict
+from urllib.parse import urlparse, parse_qs
 
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import win32com.client  # pywin32 (Windows only)
+except Exception:
+    win32com = None
+
+
+# -----------------------------
+# Theme
+# -----------------------------
 APP_TITLE = "Advising Dashboard"
 HEADER_TEXT = "One Dashboard To Rule Them All"
 
-BLUE1 = "#1e3a8a"
-BLUE2 = "#3b82f6"
-CARD = "#e0e7ff"
+ROYAL_BG = "#0b1f5e"      # solid background behind everything
+CARD_BG = "#e0e7ff"       # card background
+BORDER_BLUE = "#93c5fd"   # card border
+ROYAL_BLUE_DARK = "#1e40af"
+ROYAL_BLUE_LIGHT = "#3b82f6"
 
-def load_json(path):
-    with open(path,"r",encoding="utf-8") as f:
+TEXT_DARK = "#0f172a"
+TEXT_MUTED = "#334155"
+
+
+# Track/Subtrack label mapping (fallbacks to the code if unknown)
+TRACK_LABELS = {
+    "GT": "AAS – Network Administration",
+    "NA": "AAS – Network Administration",
+    "NT": "AAS – Network Technologies",
+    "PR": "AAS – Programming",
+}
+
+SUBTRACK_LABELS = {
+    "MS": "Microsoft Networking",
+    "CS": "Cisco Networking",
+    "LX": "Linux Administration",
+}
+
+
+# -----------------------------
+# Data
+# -----------------------------
+@dataclass
+class StudentInfo:
+    first_name: str
+    last_name: str
+    student_id: str
+    kctcs_email: str
+    personal_email: str
+    notes: str
+    track_code: str
+    subtrack_code: str
+    json_path: str
+
+    @property
+    def display_name(self) -> str:
+        name = f"{self.first_name} {self.last_name}".strip()
+        return name if name else (self.kctcs_email or "(Unnamed Student)")
+
+    @property
+    def track_label(self) -> str:
+        code = (self.track_code or "").strip()
+        return TRACK_LABELS.get(code, code or "Unknown Track")
+
+    @property
+    def subtrack_label(self) -> str:
+        code = (self.subtrack_code or "").strip()
+        return SUBTRACK_LABELS.get(code, code or "No Subtrack")
+
+    @property
+    def group_key(self) -> Tuple[str, str, str, str]:
+        # Sortable/group-friendly key: (track_label, subtrack_label, track_code, subtrack_code)
+        return (self.track_label, self.subtrack_label, (self.track_code or ""), (self.subtrack_code or ""))
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_str(v) -> str:
+    return "" if v is None else str(v)
+
+def app_base_dir() -> Path:
+    return Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+
+def settings_path() -> Path:
+    return app_base_dir() / "settings.json"
+
+def load_settings() -> dict:
+    p = settings_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_settings(d: dict):
+    p = settings_path()
+    try:
+        p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-def find_plan(obj,season,year):
-    plans=obj.get("data",{}).get("semesterPlans",[])
+def iter_json_files(root: Path):
+    for p in root.rglob("*.json"):
+        yield p
+
+def extract_student_info(obj: dict, json_path: str) -> StudentInfo:
+    student = obj.get("student") if isinstance(obj.get("student"), dict) else {}
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    sel = obj.get("selection") if isinstance(obj.get("selection"), dict) else {}
+
+    first_name = safe_str(student.get("firstName")).strip()
+    last_name = safe_str(student.get("lastName")).strip()
+    student_id = safe_str(student.get("studentId")).strip()
+    kctcs_email = safe_str(student.get("kctcsEmail")).strip()
+    personal_email = safe_str(student.get("personalEmail")).strip()
+    notes = safe_str(data.get("notes")).strip()
+
+    track_code = safe_str(sel.get("scenario")).strip()
+    subtrack_code = safe_str(sel.get("subplan")).strip()
+
+    return StudentInfo(
+        first_name=first_name,
+        last_name=last_name,
+        student_id=student_id,
+        kctcs_email=kctcs_email,
+        personal_email=personal_email,
+        notes=notes,
+        track_code=track_code,
+        subtrack_code=subtrack_code,
+        json_path=json_path
+    )
+
+def find_semester_plan(obj: dict, season: str, year: str) -> Optional[dict]:
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        return None
+    plans = data.get("semesterPlans")
+    if not isinstance(plans, list):
+        return None
+
     for p in plans:
-        if p.get("season")==season and str(p.get("year"))==str(year):
+        if not isinstance(p, dict):
+            continue
+        if safe_str(p.get("season")).strip() == season and safe_str(p.get("year")).strip() == year:
             return p
     return None
 
-def term_state(obj,season,year):
-    plan=find_plan(obj,season,year)
-    if not plan:
+
+# -----------------------------
+# Advising status logic (multi-term)
+# -----------------------------
+def term_state(obj: dict, season: str, year: str) -> str:
+    """
+    Returns: "unadvised" | "partial" | "done"
+    Rule: If courses list is empty => UNADVISED.
+    """
+    plan = find_semester_plan(obj, season, year)
+    if plan is None:
         return "unadvised"
-    courses=plan.get("courses",[])
-    if not courses:
+
+    courses = plan.get("courses", [])
+    if not isinstance(courses, list) or len(courses) == 0:
         return "unadvised"
-    if plan.get("notComplete"):
+
+    if bool(plan.get("notComplete")):
+        return "partial"
+
+    return "done"
+
+def classify_multi(obj: dict, terms: List[Tuple[str, str]]) -> str:
+    """
+    Overall bucket for the selected set of terms.
+    - If any selected term is unadvised -> needs
+    - Else if any selected term is partial -> partial
+    - Else -> done
+    """
+    any_unadvised = False
+    any_partial = False
+
+    for season, year in terms:
+        st = term_state(obj, season, year)
+        if st == "unadvised":
+            any_unadvised = True
+        elif st == "partial":
+            any_partial = True
+
+    if any_unadvised:
+        return "needs"
+    if any_partial:
         return "partial"
     return "done"
 
-class App(tk.Tk):
+def term_badges(obj: dict, terms: List[Tuple[str, str]]) -> str:
+    parts = []
+    for season, year in terms:
+        st = term_state(obj, season, year)
+        if st == "unadvised":
+            sym = "⛔"
+        elif st == "partial":
+            sym = "⚠️"
+        else:
+            sym = "✅"
+        parts.append(f"{season}: {sym}")
+    return "  ".join(parts)
 
+
+# -----------------------------
+# Tooltip
+# -----------------------------
+class Tooltip:
+    def __init__(self, parent: tk.Widget):
+        self.parent = parent
+        self.tip = None
+
+    def show(self, x: int, y: int, text: str):
+        self.hide()
+        if not text:
+            return
+        self.tip = tk.Toplevel(self.parent)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+        lbl = tk.Label(
+            self.tip,
+            text=text,
+            justify="left",
+            background="#0b1220",
+            foreground="#e5e7eb",
+            relief="solid",
+            borderwidth=1,
+            wraplength=520,
+            padx=10,
+            pady=8,
+            font=("Segoe UI", 9),
+        )
+        lbl.pack()
+
+    def hide(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+        self.tip = None
+
+
+# -----------------------------
+# Scrollable Frame
+# -----------------------------
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, background=CARD_BG)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.inner_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vsb.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add=True)
+
+    def _on_inner_configure(self, _):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self.inner_id, width=event.width)
+
+    def _on_mousewheel(self, event):
+        if self.winfo_containing(event.x_root, event.y_root) in (self.canvas, self.inner):
+            delta = -1 * int(event.delta / 120)
+            self.canvas.yview_scroll(delta, "units")
+
+    def clear(self):
+        for child in self.inner.winfo_children():
+            child.destroy()
+
+
+# -----------------------------
+# Outlook email (HTML)
+# -----------------------------
+def ensure_outlook_ready():
+    if platform.system().lower() != "windows":
+        raise RuntimeError("Outlook emailing is only supported on Windows.")
+    if win32com is None:
+        raise RuntimeError("pywin32 is not installed. Install on Windows with: pip install pywin32")
+
+def _nl2br(text: str) -> str:
+    return html.escape(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+def build_email_subject(base_subject: str, term_label: str) -> str:
+    s = (base_subject or "").strip()
+    if not s:
+        s = "Advising Appointment Needed"
+    if term_label and term_label.lower() in s.lower():
+        return s
+    return f"{s} — {term_label}" if term_label else s
+
+def build_email_html(first_name: str, message_text: str, scheduling_link: str) -> str:
+    first = (first_name or "").strip() or "there"
+    msg_html = _nl2br(message_text)
+
+    link = (scheduling_link or "").strip()
+    button_block = ""
+    if link:
+        safe_link = html.escape(link, quote=True)
+        button_block = f"""
+          <div style="margin-top:18px;">
+            <a href="{safe_link}"
+               style="display:inline-block;background:#3b82f6;color:#ffffff;text-decoration:none;
+                      padding:10px 14px;border-radius:999px;font-weight:700;font-size:14px;">
+              Schedule Appointment
+            </a>
+          </div>
+        """
+
+    return f"""
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f1f5f9;font-family:Segoe UI, Arial, sans-serif;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+      <tr>
+        <td align="center" style="padding:18px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640"
+                 style="max-width:640px;background:#ffffff;border:1px solid #dbeafe;border-radius:14px;overflow:hidden;">
+            <tr>
+              <td style="background:#1e3a8a;padding:18px 20px;">
+                <div style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:.2px;">
+                  Advising Appointment
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px;">
+                <div style="color:#0f172a;font-size:15px;font-weight:700;margin-bottom:12px;">
+                  Hello {html.escape(first)},
+                </div>
+
+                <div style="color:#334155;font-size:14px;line-height:1.55;">
+                  {msg_html}
+                </div>
+
+                {button_block}
+
+                <div style="margin-top:18px;color:#0f172a;font-size:14px;">
+                  Thanks,<br>
+                  <span style="color:#334155;">(Your Advisor)</span>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:14px 20px;background:#f8fafc;border-top:1px solid #e2e8f0;">
+                <div style="color:#64748b;font-size:12px;line-height:1.4;">
+                  This email was generated from the advising dashboard.
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+def outlook_create_email_html(kctcs_email: str, personal_email: str, subject: str, html_body: str, draft: bool = True):
+    ensure_outlook_ready()
+
+    to_list = [e.strip() for e in [kctcs_email, personal_email] if e and str(e).strip()]
+    if not to_list:
+        raise RuntimeError("Student has no email addresses in JSON (KCTCS or personal).")
+
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+    mail.To = "; ".join(to_list)
+    mail.Subject = subject
+    mail.HTMLBody = html_body
+
+    if draft:
+        mail.Save()
+    else:
+        mail.Send()
+
+
+# -----------------------------
+# Local editor server (loads/saves student JSON + serves Advising10.html)
+# -----------------------------
+class LocalEditorServer:
+    def __init__(self, base_dir: Path, html_filename: str = "Advising10.html"):
+        self.base_dir = base_dir
+        self.html_path = base_dir / html_filename
+        self._httpd: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._port: Optional[int] = None
+        self._token_to_json: Dict[str, Path] = {}
+
+    @property
+    def port(self) -> int:
+        if self._port is None:
+            raise RuntimeError("Server not started")
+        return self._port
+
+    def set_mapping(self, token: str, json_path: Path):
+        self._token_to_json[token] = json_path
+
+    def start(self):
+        if self._httpd is not None:
+            return
+
+        if not self.html_path.exists():
+            raise RuntimeError(f"Missing {self.html_path.name}. Put it in the same folder as the EXE.")
+
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, code: int, body: bytes, content_type: str = "text/plain; charset=utf-8"):
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+
+                if parsed.path == "/" or parsed.path.endswith("/"):
+                    self.send_response(302)
+                    self.send_header("Location", f"/{server.html_path.name}")
+                    self.end_headers()
+                    return
+
+                if parsed.path == f"/{server.html_path.name}":
+                    try:
+                        data = server.html_path.read_bytes()
+                        self._send(200, data, "text/html; charset=utf-8")
+                    except Exception as e:
+                        self._send(500, f"Error reading HTML: {e}".encode("utf-8"))
+                    return
+
+                if parsed.path == "/api/student":
+                    qs = parse_qs(parsed.query)
+                    token = (qs.get("token") or [""])[0]
+                    if not token or token not in server._token_to_json:
+                        self._send(404, b"Unknown token")
+                        return
+
+                    p = server._token_to_json[token]
+                    try:
+                        body = p.read_bytes()
+                        self._send(200, body, "application/json; charset=utf-8")
+                    except Exception as e:
+                        self._send(500, f"Error reading JSON: {e}".encode("utf-8"))
+                    return
+
+                self._send(404, b"Not found")
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                if parsed.path != "/api/save":
+                    self._send(404, b"Not found")
+                    return
+
+                qs = parse_qs(parsed.query)
+                token = (qs.get("token") or [""])[0]
+                if not token or token not in server._token_to_json:
+                    self._send(404, b"Unknown token")
+                    return
+
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b""
+
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    self._send(400, b"Invalid JSON")
+                    return
+
+                target = server._token_to_json[token]
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+
+                    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                    backup = target.with_name(f"{target.stem}_backup_{stamp}{target.suffix}")
+                    if target.exists():
+                        backup.write_bytes(target.read_bytes())
+
+                    pretty = json.dumps(obj, indent=2, ensure_ascii=False)
+                    target.write_text(pretty, encoding="utf-8")
+
+                    self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
+                except Exception as e:
+                    self._send(500, f"Save failed: {e}".encode("utf-8"))
+
+            def log_message(self, _format, *_args):
+                return
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd = httpd
+        self._port = httpd.server_address[1]
+
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        self._thread = t
+        t.start()
+
+    def stop(self):
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+            self._httpd = None
+            self._thread = None
+            self._port = None
+
+
+# -----------------------------
+# App
+# -----------------------------
+class AdvisingDashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1300x850")
+        self.geometry("1320x860")
+        self.minsize(1180, 740)
+        self.configure(bg=ROYAL_BG)
 
-        self.folder=tk.StringVar()
-        self.year=tk.StringVar(value="2026")
+        self.tooltip = Tooltip(self)
 
-        self.spring=tk.BooleanVar()
-        self.summer=tk.BooleanVar()
-        self.fall=tk.BooleanVar(value=True)
+        self.year_var = tk.StringVar(value="2026")
+        self.folder_var = tk.StringVar(value=str(self.default_advising_folder()))
 
-        self.search=tk.StringVar()
+        self.spring_var = tk.BooleanVar(value=False)
+        self.summer_var = tk.BooleanVar(value=False)
+        self.fall_var = tk.BooleanVar(value=True)
 
-        self.subject=tk.StringVar(value="Advising Appointment Needed")
-        self.link=tk.StringVar()
+        self.search_var = tk.StringVar(value="")
 
-        self.students=[]
-        self.needs=[]
-        self.partial=[]
-        self.done=[]
+        self.count_needs = tk.StringVar(value="Needs Advised: 0")
+        self.count_partial = tk.StringVar(value="Advised Not Complete: 0")
+        self.count_done = tk.StringVar(value="Advised: 0")
 
-        self.build_ui()
+        self.all_needs_students: list[StudentInfo] = []
+        self.all_partial_students: list[StudentInfo] = []
+        self.all_done_students: list[StudentInfo] = []
 
-    def build_ui(self):
+        self.needs_students: list[StudentInfo] = []
+        self.partial_students: list[StudentInfo] = []
+        self.done_students: list[StudentInfo] = []
 
-        header=tk.Label(self,text=HEADER_TEXT,font=("Segoe UI",22,"bold"),fg="white",bg=BLUE1)
-        header.pack(fill="x")
+        self.needs_checks: dict[str, tk.BooleanVar] = {}
 
-        top=tk.Frame(self)
-        top.pack(fill="x",padx=10,pady=8)
+        s = load_settings()
+        self.subject_var = tk.StringVar(value=s.get("subject", "Advising Appointment Needed"))
+        self.scheduling_link_var = tk.StringVar(value=s.get("schedulingLink", ""))
 
-        ttk.Label(top,text="Year").pack(side="left")
-        ttk.Combobox(top,textvariable=self.year,values=[str(x) for x in range(2026,2035)],width=6).pack(side="left",padx=5)
+        self._last_obj_by_path: dict = {}
+        self._last_terms: List[Tuple[str, str]] = []
 
-        ttk.Checkbutton(top,text="Spring",variable=self.spring).pack(side="left")
-        ttk.Checkbutton(top,text="Summer",variable=self.summer).pack(side="left")
-        ttk.Checkbutton(top,text="Fall",variable=self.fall).pack(side="left")
+        self.server = LocalEditorServer(app_base_dir(), "Advising10.html")
 
-        ttk.Entry(top,textvariable=self.search,width=20).pack(side="left",padx=10)
+        self._apply_theme()
+        self._build_ui()
 
-        ttk.Entry(top,textvariable=self.folder,width=40).pack(side="left",padx=10)
-        ttk.Button(top,text="Browse",command=self.browse).pack(side="left")
+        self.search_var.trace_add("write", lambda *_: self.apply_filter())
 
-        ttk.Button(top,text="Scan",command=self.scan).pack(side="left",padx=10)
+    def default_advising_folder(self) -> Path:
+        return app_base_dir() / "Advising"
 
-        email=tk.LabelFrame(self,text="Email Settings")
-        email.pack(fill="x",padx=10,pady=6)
+    def selected_terms(self) -> List[Tuple[str, str]]:
+        year = self.year_var.get().strip()
+        out: List[Tuple[str, str]] = []
+        if self.spring_var.get():
+            out.append(("Spring", year))
+        if self.summer_var.get():
+            out.append(("Summer", year))
+        if self.fall_var.get():
+            out.append(("Fall", year))
+        return out
 
-        ttk.Label(email,text="Subject").pack(anchor="w")
-        ttk.Entry(email,textvariable=self.subject).pack(fill="x")
+    def term_label(self) -> str:
+        year = self.year_var.get().strip()
+        terms = [t for (t, _y) in self.selected_terms()]
+        if not terms:
+            return year
+        return f"{'/'.join(terms)} {year}"
 
-        ttk.Label(email,text="Scheduling link").pack(anchor="w")
-        ttk.Entry(email,textvariable=self.link).pack(fill="x")
+    def _apply_theme(self):
+        style = ttk.Style()
+        style.theme_use("clam")
 
-        ttk.Label(email,text="Message").pack(anchor="w")
+        style.configure("Top.TLabelframe", background=CARD_BG, foreground=TEXT_DARK, bordercolor=BORDER_BLUE)
+        style.configure("Top.TLabelframe.Label", background=CARD_BG, foreground=ROYAL_BLUE_DARK, font=("Segoe UI", 11, "bold"))
 
-        self.body=tk.Text(email,height=4)
-        self.body.pack(fill="x")
-        self.body.insert("1.0","Please reply to schedule an advising appointment.")
+        style.configure("Card.TLabelframe", background=CARD_BG, foreground=TEXT_DARK, bordercolor=BORDER_BLUE)
+        style.configure("Card.TLabelframe.Label", background=CARD_BG, foreground=ROYAL_BLUE_DARK, font=("Segoe UI", 11, "bold"))
 
-        main=tk.Frame(self)
-        main.pack(fill="both",expand=True,padx=10,pady=10)
+        style.configure("Blue.TButton", background=ROYAL_BLUE_LIGHT, foreground="white",
+                        font=("Segoe UI", 10, "bold"), padding=(12, 7), borderwidth=0, focusthickness=0)
+        style.map("Blue.TButton", background=[("active", ROYAL_BLUE_DARK)])
 
-        self.col1=self.make_column(main,"Needs Advised")
-        self.col2=self.make_column(main,"Advised Not Complete")
-        self.col3=self.make_column(main,"Advised")
+        style.configure("Pill.TButton", background=ROYAL_BLUE_LIGHT, foreground="white",
+                        font=("Segoe UI", 9, "bold"), padding=(12, 6), borderwidth=0, focusthickness=0)
+        style.map("Pill.TButton", background=[("active", ROYAL_BLUE_DARK)])
 
-        self.col1.pack(side="left",fill="both",expand=True,padx=5)
-        self.col2.pack(side="left",fill="both",expand=True,padx=5)
-        self.col3.pack(side="left",fill="both",expand=True,padx=5)
+        style.configure("Ghost.TButton", background=CARD_BG, foreground=ROYAL_BLUE_DARK,
+                        font=("Segoe UI", 9, "bold"), padding=(10, 6), borderwidth=1)
+        style.map("Ghost.TButton", background=[("active", "#c7d2fe")])
 
-    def make_column(self,parent,title):
-        frame=tk.LabelFrame(parent,text=title)
-        canvas=tk.Canvas(frame)
-        scroll=ttk.Scrollbar(frame,orient="vertical",command=canvas.yview)
-        inner=tk.Frame(canvas)
+        style.configure("Summary.TLabel", background=CARD_BG, foreground=TEXT_DARK, font=("Segoe UI", 10, "bold"))
 
-        inner.bind("<Configure>",lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    def _save_settings(self):
+        save_settings({
+            "subject": self.subject_var.get(),
+            "schedulingLink": self.scheduling_link_var.get()
+        })
 
-        canvas.create_window((0,0),window=inner,anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
+    def _quick_pair_summer_fall(self):
+        self.spring_var.set(False)
+        self.summer_var.set(True)
+        self.fall_var.set(True)
 
-        canvas.pack(side="left",fill="both",expand=True)
-        scroll.pack(side="right",fill="y")
+    def _build_ui(self):
+        # Solid background container
+        self.container = tk.Frame(self, bg=ROYAL_BG, highlightthickness=0, bd=0)
+        self.container.pack(fill="both", expand=True)
 
-        frame.inner=inner
-        return frame
+        header = tk.Frame(self.container, bg=ROYAL_BG, highlightthickness=0)
+        header.pack(fill="x", pady=(10, 2))
+        tk.Label(
+            header,
+            text=HEADER_TEXT,
+            bg=ROYAL_BG,
+            fg="white",
+            font=("Segoe UI", 22, "bold")
+        ).pack(pady=(2, 6))
 
-    def browse(self):
-        d=filedialog.askdirectory()
-        if d:
-            self.folder.set(d)
+        top = ttk.Labelframe(self.container, text="Controls", padding=12, style="Top.TLabelframe")
+        top.pack(fill="x", padx=12, pady=(8, 10))
 
-    def selected_terms(self):
-        terms=[]
-        y=self.year.get()
+        ttk.Label(top, text="Year:", foreground=TEXT_DARK, background=CARD_BG, font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Combobox(top, textvariable=self.year_var, state="readonly",
+                     values=[str(y) for y in range(2026, 2041)], width=8).pack(side="left", padx=(8, 16))
 
-        if self.spring.get():
-            terms.append(("Spring",y))
-        if self.summer.get():
-            terms.append(("Summer",y))
-        if self.fall.get():
-            terms.append(("Fall",y))
+        ttk.Label(top, text="Advise for:", foreground=TEXT_DARK, background=CARD_BG, font=("Segoe UI", 10, "bold")).pack(side="left")
 
-        return terms
+        def blue_check(master, text, var):
+            cb = tk.Checkbutton(
+                master, text=text, variable=var,
+                bg=CARD_BG, fg=TEXT_DARK,
+                activebackground=CARD_BG, activeforeground=TEXT_DARK,
+                selectcolor="#dbeafe",
+                font=("Segoe UI", 10, "bold"),
+                highlightthickness=0
+            )
+            cb.pack(side="left", padx=(10, 0))
+            return cb
+
+        blue_check(top, "Spring", self.spring_var)
+        blue_check(top, "Summer", self.summer_var)
+        blue_check(top, "Fall", self.fall_var)
+
+        ttk.Button(top, text="Quick pair: Summer + Fall", style="Ghost.TButton",
+                   command=self._quick_pair_summer_fall).pack(side="left", padx=(16, 16))
+
+        ttk.Label(top, text="Search:", foreground=TEXT_DARK, background=CARD_BG,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Entry(top, textvariable=self.search_var, width=22).pack(side="left", padx=(8, 16))
+
+        ttk.Label(top, text="Advising folder:", foreground=TEXT_DARK, background=CARD_BG,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Entry(top, textvariable=self.folder_var, width=40).pack(side="left", padx=(8, 8))
+
+        ttk.Button(top, text="Browse…", style="Ghost.TButton", command=self.browse_folder).pack(side="left", padx=(0, 10))
+        ttk.Button(top, text="Scan", style="Blue.TButton", command=self.scan).pack(side="left")
+
+        self.status_label = ttk.Label(top, text="Ready", style="Summary.TLabel")
+        self.status_label.pack(side="right")
+
+        summary = ttk.Frame(self.container, padding=(12, 0), style="Top.TLabelframe")
+        summary.pack(fill="x")
+        ttk.Label(summary, textvariable=self.count_needs, style="Summary.TLabel").pack(side="left", padx=(0, 14))
+        ttk.Label(summary, textvariable=self.count_partial, style="Summary.TLabel").pack(side="left", padx=(0, 14))
+        ttk.Label(summary, textvariable=self.count_done, style="Summary.TLabel").pack(side="left")
+
+        email_box = ttk.Labelframe(self.container, text="Email settings", padding=10, style="Card.TLabelframe")
+        email_box.pack(fill="x", padx=12, pady=(10, 10))
+
+        row1 = ttk.Frame(email_box)
+        row1.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(row1, text="Subject:", background=CARD_BG, foreground=TEXT_DARK,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        subj_entry = ttk.Entry(row1, textvariable=self.subject_var)
+        subj_entry.pack(side="left", fill="x", expand=True, padx=(8, 12))
+
+        ttk.Label(row1, text="Scheduling link:", background=CARD_BG, foreground=TEXT_DARK,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        link_entry = ttk.Entry(row1, textvariable=self.scheduling_link_var, width=44)
+        link_entry.pack(side="left", padx=(8, 0))
+
+        subj_entry.bind("<FocusOut>", lambda _e: self._save_settings())
+        link_entry.bind("<FocusOut>", lambda _e: self._save_settings())
+
+        ttk.Label(email_box, text="Message:", background=CARD_BG, foreground=TEXT_DARK,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        self.email_body = tk.Text(email_box, height=4, wrap="word", bd=1, relief="solid", highlightthickness=0)
+        self.email_body.pack(fill="x", expand=True)
+        self.email_body.insert("1.0", "Please reply to schedule an advising appointment for the selected semester(s).")
+
+        main = ttk.Frame(self.container, padding=(12, 0, 12, 12))
+        main.pack(fill="both", expand=True)
+
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=1)
+        main.columnconfigure(2, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        self.frame_needs = ttk.Labelframe(main, text="Needs advised (0)", padding=10, style="Card.TLabelframe")
+        self.frame_partial = ttk.Labelframe(main, text="Advised (not complete) (0)", padding=10, style="Card.TLabelframe")
+        self.frame_done = ttk.Labelframe(main, text="Advised (0)", padding=10, style="Card.TLabelframe")
+
+        self.frame_needs.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.frame_partial.grid(row=0, column=1, sticky="nsew", padx=8)
+        self.frame_done.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+
+        needs_controls = ttk.Frame(self.frame_needs)
+        needs_controls.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(needs_controls, text="Select all", style="Ghost.TButton", command=self.needs_select_all).pack(side="left")
+        ttk.Button(needs_controls, text="Select none", style="Ghost.TButton", command=self.needs_select_none).pack(side="left", padx=(8, 0))
+
+        ttk.Button(needs_controls, text="Draft selected", style="Blue.TButton",
+                   command=lambda: self.email_selected_needs(draft=True)).pack(side="right")
+        ttk.Button(needs_controls, text="Send selected", style="Ghost.TButton",
+                   command=lambda: self.email_selected_needs(draft=False)).pack(side="right", padx=(0, 8))
+
+        self.needs_list = ScrollableFrame(self.frame_needs)
+        self.needs_list.pack(fill="both", expand=True)
+
+        self.partial_list = ScrollableFrame(self.frame_partial)
+        self.partial_list.pack(fill="both", expand=True)
+
+        self.done_list = ScrollableFrame(self.frame_done)
+        self.done_list.pack(fill="both", expand=True)
+
+    def browse_folder(self):
+        chosen = filedialog.askdirectory(title="Select Advising folder")
+        if chosen:
+            self.folder_var.set(chosen)
+
+    def set_status(self, text: str):
+        self.status_label.config(text=text)
+        self.update_idletasks()
+
+    def needs_select_all(self):
+        for var in self.needs_checks.values():
+            var.set(True)
+
+    def needs_select_none(self):
+        for var in self.needs_checks.values():
+            var.set(False)
+
+    def _current_subject(self) -> str:
+        return build_email_subject(self.subject_var.get(), self.term_label())
+
+    def _current_message_text(self) -> str:
+        return self.email_body.get("1.0", "end").strip()
+
+    def _current_link(self) -> str:
+        return self.scheduling_link_var.get().strip()
+
+    def _matches_search(self, s: StudentInfo, q: str) -> bool:
+        if not q:
+            return True
+        blob = " ".join([
+            s.display_name,
+            s.student_id,
+            s.kctcs_email,
+            s.personal_email,
+            s.track_label,
+            s.subtrack_label
+        ]).lower()
+        return q in blob
+
+    def apply_filter(self):
+        q = self.search_var.get().strip().lower()
+
+        self.needs_students = [s for s in self.all_needs_students if self._matches_search(s, q)]
+        self.partial_students = [s for s in self.all_partial_students if self._matches_search(s, q)]
+        self.done_students = [s for s in self.all_done_students if self._matches_search(s, q)]
+
+        self._render_all()
+
+    def _render_all(self):
+        terms = self._last_terms
+        obj_by_path = self._last_obj_by_path
+
+        self._render_needs(obj_by_path, terms)
+        self._render_partial(obj_by_path, terms)
+        self._render_done(obj_by_path, terms)
+
+        n_needs = len(self.needs_students)
+        n_partial = len(self.partial_students)
+        n_done = len(self.done_students)
+
+        self.count_needs.set(f"Needs Advised: {n_needs}")
+        self.count_partial.set(f"Advised Not Complete: {n_partial}")
+        self.count_done.set(f"Advised: {n_done}")
+
+        self.frame_needs.config(text=f"Needs advised ({n_needs})")
+        self.frame_partial.config(text=f"Advised (not complete) ({n_partial})")
+        self.frame_done.config(text=f"Advised ({n_done})")
+
+    def email_selected_needs(self, draft: bool):
+        selected = []
+        for s in self.needs_students:
+            var = self.needs_checks.get(s.json_path)
+            if var and var.get():
+                selected.append(s)
+
+        if not selected:
+            messagebox.showinfo("No selection", "Select at least one student to email.")
+            return
+
+        try:
+            ensure_outlook_ready()
+        except Exception as e:
+            messagebox.showerror("Email unavailable", str(e))
+            return
+
+        if not draft:
+            confirm = messagebox.askyesno("Confirm send", f"Send {len(selected)} email(s) now?")
+            if not confirm:
+                return
+
+        subject = self._current_subject()
+        message_text = self._current_message_text()
+        link = self._current_link()
+
+        ok = 0
+        err = 0
+
+        for s in selected:
+            try:
+                html_body = build_email_html(s.first_name, message_text, link)
+                outlook_create_email_html(s.kctcs_email, s.personal_email, subject, html_body, draft=draft)
+                ok += 1
+            except Exception:
+                err += 1
+
+        mode = "Drafted" if draft else "Sent"
+        messagebox.showinfo("Email complete", f"{mode}: {ok}\nErrors: {err}")
+
+    def email_one_partial(self, s: StudentInfo):
+        try:
+            ensure_outlook_ready()
+        except Exception as e:
+            messagebox.showerror("Email unavailable", str(e))
+            return
+
+        subject = self._current_subject()
+        message_text = self._current_message_text()
+        link = self._current_link()
+
+        try:
+            html_body = build_email_html(s.first_name, message_text, link)
+            outlook_create_email_html(s.kctcs_email, s.personal_email, subject, html_body, draft=True)
+            messagebox.showinfo("Draft created", f"Draft email created for {s.display_name}.")
+        except Exception as e:
+            messagebox.showerror("Email failed", str(e))
+
+    def open_in_editor(self, json_path: str):
+        try:
+            self.server.start()
+        except Exception as e:
+            messagebox.showerror("Editor unavailable", str(e))
+            return
+
+        token = uuid.uuid4().hex
+        self.server.set_mapping(token, Path(json_path))
+
+        url = f"http://127.0.0.1:{self.server.port}/{self.server.html_path.name}?token={token}&json=/api/student?token={token}&save=/api/save?token={token}"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("Could not open browser", str(e))
+
+    def _render_name_link(self, parent, text: str, json_path: str):
+        lbl = tk.Label(
+            parent,
+            text=text,
+            bg=CARD_BG,
+            fg=ROYAL_BLUE_DARK,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2"
+        )
+        lbl.pack(anchor="w")
+        lbl.bind("<Button-1>", lambda _e: self.open_in_editor(json_path))
+        lbl.bind("<Enter>", lambda _e: lbl.config(fg=ROYAL_BLUE_LIGHT))
+        lbl.bind("<Leave>", lambda _e: lbl.config(fg=ROYAL_BLUE_DARK))
+        return lbl
+
+    def _grouped(self, students: List[StudentInfo]) -> List[Tuple[Tuple[str, str, str, str], List[StudentInfo]]]:
+        buckets: DefaultDict[Tuple[str, str, str, str], List[StudentInfo]] = defaultdict(list)
+        for s in students:
+            buckets[s.group_key].append(s)
+
+        items = list(buckets.items())
+        items.sort(key=lambda kv: (kv[0][0].lower(), kv[0][1].lower(), kv[0][2].lower(), kv[0][3].lower()))
+        for _k, lst in items:
+            lst.sort(key=lambda s: s.display_name.lower())
+        return items
+
+    def _render_group_header(self, parent, track_label: str, subtrack_label: str, count: int):
+        hdr = tk.Frame(parent, bg="#c7d2fe", highlightthickness=0, bd=0)
+        hdr.pack(fill="x", pady=(8, 4))
+        txt = f"{track_label} / {subtrack_label} ({count})"
+        tk.Label(hdr, text=txt, bg="#c7d2fe", fg=ROYAL_BLUE_DARK,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=6)
+
+    def _render_needs(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
+        self.needs_list.clear()
+        self.needs_checks.clear()
+
+        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.needs_students):
+            self._render_group_header(self.needs_list.inner, track_label, subtrack_label, len(group_students))
+
+            for s in group_students:
+                holder = tk.Frame(self.needs_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
+                holder.pack(fill="x", pady=4)
+
+                row = ttk.Frame(holder)
+                row.pack(fill="x", padx=8, pady=6)
+
+                var = tk.BooleanVar(value=True)
+                self.needs_checks[s.json_path] = var
+
+                tk.Checkbutton(row, variable=var, bg=CARD_BG, activebackground=CARD_BG,
+                              highlightthickness=0).pack(side="left", padx=(0, 10))
+
+                left = ttk.Frame(row)
+                left.pack(side="left", fill="x", expand=True)
+
+                self._render_name_link(left, s.display_name, s.json_path)
+
+                badges = ""
+                obj = obj_by_path.get(s.json_path)
+                if obj is not None:
+                    badges = term_badges(obj, terms)
+
+                ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(anchor="w")
+
+                ttk.Label(row, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(side="right")
+
+    def _render_partial(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
+        self.partial_list.clear()
+
+        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.partial_students):
+            self._render_group_header(self.partial_list.inner, track_label, subtrack_label, len(group_students))
+
+            for s in group_students:
+                holder = tk.Frame(self.partial_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
+                holder.pack(fill="x", pady=4)
+
+                row = ttk.Frame(holder)
+                row.pack(fill="x", padx=8, pady=8)
+
+                left = ttk.Frame(row)
+                left.pack(side="left", fill="x", expand=True)
+
+                self._render_name_link(left, s.display_name, s.json_path)
+
+                badges = ""
+                obj = obj_by_path.get(s.json_path)
+                if obj is not None:
+                    badges = term_badges(obj, terms)
+
+                ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(anchor="w")
+
+                ttk.Label(left, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(anchor="w")
+
+                right = ttk.Frame(row)
+                right.pack(side="right")
+
+                if s.notes.strip():
+                    notes_lbl = tk.Label(
+                        right,
+                        text="Notes",
+                        bg="#dbeafe",
+                        fg=ROYAL_BLUE_DARK,
+                        padx=10,
+                        pady=4,
+                        font=("Segoe UI", 9, "bold"),
+                        cursor="question_arrow"
+                    )
+                    notes_lbl.pack(side="left", padx=(0, 8))
+
+                    notes_lbl.bind("<Enter>", lambda _e, n=s.notes: self.tooltip.show(self.winfo_pointerx()+12, self.winfo_pointery()+12, n))
+                    notes_lbl.bind("<Leave>", lambda _e: self.tooltip.hide())
+
+                ttk.Button(right, text="Email", style="Pill.TButton",
+                           command=lambda stu=s: self.email_one_partial(stu)).pack(side="left")
+
+    def _render_done(self, obj_by_path: dict, terms: List[Tuple[str, str]]):
+        self.done_list.clear()
+
+        for (track_label, subtrack_label, _tc, _sc), group_students in self._grouped(self.done_students):
+            self._render_group_header(self.done_list.inner, track_label, subtrack_label, len(group_students))
+
+            for s in group_students:
+                holder = tk.Frame(self.done_list.inner, bg=CARD_BG, highlightbackground=BORDER_BLUE, highlightthickness=1)
+                holder.pack(fill="x", pady=4)
+
+                row = ttk.Frame(holder)
+                row.pack(fill="x", padx=8, pady=8)
+
+                left = ttk.Frame(row)
+                left.pack(side="left", fill="x", expand=True)
+
+                self._render_name_link(left, s.display_name, s.json_path)
+
+                badges = ""
+                obj = obj_by_path.get(s.json_path)
+                if obj is not None:
+                    badges = term_badges(obj, terms)
+
+                ttk.Label(left, text=badges, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(anchor="w")
+
+                ttk.Label(row, text=s.student_id, background=CARD_BG, foreground=TEXT_MUTED,
+                          font=("Segoe UI", 9)).pack(side="right")
 
     def scan(self):
-
-        folder=Path(self.folder.get())
-        if not folder.exists():
-            messagebox.showerror("Error","Folder not found")
-            return
-
-        terms=self.selected_terms()
+        terms = self.selected_terms()
         if not terms:
-            messagebox.showerror("Error","Select a semester")
+            messagebox.showerror("Select term(s)", "Pick at least one term (Spring/Summer/Fall) to scan.")
             return
 
-        self.needs=[]
-        self.partial=[]
-        self.done=[]
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Folder not found", f"Advising folder does not exist:\n{folder}")
+            return
 
-        for f in folder.rglob("*.json"):
+        label = self.term_label()
+        self.set_status(f"Scanning for {label}…")
+
+        needs: list[StudentInfo] = []
+        partial: list[StudentInfo] = []
+        done: list[StudentInfo] = []
+
+        files = list(iter_json_files(folder))
+        bad_files = 0
+
+        obj_by_path: dict = {}
+
+        for p in files:
             try:
-                obj=load_json(f)
-                name=obj["student"]["firstName"]+" "+obj["student"]["lastName"]
-                sid=obj["student"]["studentId"]
+                obj = load_json(p)
+                obj_by_path[str(p)] = obj
 
-                bucket="done"
+                bucket = classify_multi(obj, terms)
+                info = extract_student_info(obj, str(p))
 
-                for season,year in terms:
-                    state=term_state(obj,season,year)
-
-                    if state=="unadvised":
-                        bucket="needs"
-                        break
-                    elif state=="partial":
-                        bucket="partial"
-
-                data=(name,sid,str(f),obj)
-
-                if bucket=="needs":
-                    self.needs.append(data)
-                elif bucket=="partial":
-                    self.partial.append(data)
+                if bucket == "needs":
+                    needs.append(info)
+                elif bucket == "partial":
+                    partial.append(info)
                 else:
-                    self.done.append(data)
+                    done.append(info)
+            except Exception:
+                bad_files += 1
+                continue
 
-            except:
-                pass
+        self.all_needs_students = needs
+        self.all_partial_students = partial
+        self.all_done_students = done
 
-        self.render()
+        self._last_obj_by_path = obj_by_path
+        self._last_terms = terms
 
-    def render(self):
+        self.apply_filter()
 
-        for col in [self.col1,self.col2,self.col3]:
-            for w in col.inner.winfo_children():
-                w.destroy()
+        msg = f"{len(files)} file(s) scanned"
+        if bad_files:
+            msg += f" • {bad_files} unreadable"
+        self.set_status(msg)
 
-        for name,sid,path,obj in self.needs:
-            self.render_student(self.col1.inner,name,sid,path,obj,needs=True)
 
-        for name,sid,path,obj in self.partial:
-            self.render_student(self.col2.inner,name,sid,path,obj,email_button=True)
-
-        for name,sid,path,obj in self.done:
-            self.render_student(self.col3.inner,name,sid,path,obj)
-
-    def render_student(self,parent,name,sid,path,obj,needs=False,email_button=False):
-
-        row=tk.Frame(parent,bd=1,relief="solid",bg=CARD)
-        row.pack(fill="x",pady=3)
-
-        link=tk.Label(row,text=name,font=("Segoe UI",10,"bold"),fg="blue",cursor="hand2",bg=CARD)
-        link.pack(anchor="w",padx=5)
-
-        link.bind("<Button-1>",lambda e:self.open_editor(path))
-
-        tk.Label(row,text=sid,bg=CARD).pack(anchor="w",padx=5)
-
-        if email_button:
-            b=tk.Button(row,text="Email",bg=BLUE2,fg="white",command=lambda:self.email_student(obj))
-            b.pack(anchor="e",padx=5,pady=3)
-
-    def open_editor(self,json_path):
-
-        token=str(uuid.uuid4())
-        url=f"http://127.0.0.1:8123/Advising10.html?token={token}&json={json_path}"
-        webbrowser.open(url)
-
-    def email_student(self,obj):
-
-        first=obj["student"].get("firstName","")
-        k=obj["student"].get("kctcsEmail","")
-        p=obj["student"].get("personalEmail","")
-
-        body=self.body.get("1.0","end").strip()
-        subject=self.subject.get()
-
-        html_body=f"""
-        <html>
-        <body>
-        <p>Hello {html.escape(first)},</p>
-        <p>{html.escape(body)}</p>
-        <p><a href="{html.escape(self.link.get())}">Schedule Appointment</a></p>
-        </body>
-        </html>
-        """
-
-        outlook=win32com.client.Dispatch("Outlook.Application")
-        mail=outlook.CreateItem(0)
-
-        mail.To=";".join([k,p])
-        mail.Subject=subject
-        mail.HTMLBody=html_body
-        mail.Display()
-
-if __name__=="__main__":
-    app=App()
+def main():
+    app = AdvisingDashboardApp()
     app.mainloop()
+
+if __name__ == "__main__":
+    main()
